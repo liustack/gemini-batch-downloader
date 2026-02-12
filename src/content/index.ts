@@ -35,17 +35,14 @@ function injectInterceptor(): void {
 // Inject as early as possible so fetch is patched before any downloads
 injectInterceptor();
 
-// ── Blob capture via postMessage ──────────────────────────────────────
+// ── Blob capture via postMessage (FIFO queue for pipelined downloads) ─
 type BlobResolver = (dataUrl: string) => void;
-let pendingBlobResolve: BlobResolver | null = null;
+const pendingBlobQueue: BlobResolver[] = [];
 
 window.addEventListener('message', (event) => {
     if (event.source !== window || event.data?.type !== 'GBD_IMAGE_CAPTURED') return;
-    if (pendingBlobResolve) {
-        const resolve = pendingBlobResolve;
-        pendingBlobResolve = null;
-        resolve(event.data.dataUrl);
-    }
+    const resolve = pendingBlobQueue.shift();
+    if (resolve) resolve(event.data.dataUrl);
 });
 
 // ── Download suppression control ─────────────────────────────────────
@@ -78,15 +75,17 @@ function findDownloadButton(thumbnailUrl: string): HTMLButtonElement | null {
 function clickAndWaitForBlob(button: HTMLButtonElement, timeoutMs = 30000): Promise<string> {
     return new Promise<string>((resolve, reject) => {
         const timer = setTimeout(() => {
-            pendingBlobResolve = null;
+            const idx = pendingBlobQueue.indexOf(onBlob);
+            if (idx !== -1) pendingBlobQueue.splice(idx, 1);
             reject(new Error('等待原生下载响应超时'));
         }, timeoutMs);
 
-        pendingBlobResolve = (dataUrl: string) => {
+        const onBlob: BlobResolver = (dataUrl: string) => {
             clearTimeout(timer);
             resolve(dataUrl);
         };
 
+        pendingBlobQueue.push(onBlob);
         button.click();
     });
 }
@@ -756,52 +755,58 @@ async function startDownload(): Promise<void> {
     scheduleRender();
 
     const prefix = state.prefix || 'gemini';
+    const CLICK_INTERVAL_MS = 1000;
 
     // Ensure interceptor is injected and suppress native downloads
     injectInterceptor();
     setSuppressDownload(true);
 
-    for (let i = 0; i < selectedImages.length; i++) {
-        const image = selectedImages[i];
+    // Pipeline: stagger clicks 1s apart, blob capture + background processing run concurrently
+    const tasks = selectedImages.map((image, i) => {
         const filename = `${prefix}_${i + 1}.png`;
-
-        try {
-            // Find the native "Download full size" button for this image
-            const button = findDownloadButton(image.thumbnailUrl);
-            if (!button) {
-                throw new Error('未找到对应的原生下载按钮');
+        return (async () => {
+            // Stagger: wait i seconds before clicking
+            if (i > 0) {
+                await new Promise((r) => setTimeout(r, i * CLICK_INTERVAL_MS));
             }
 
-            // Click native button and wait for intercepted blob
-            const dataUrl = await clickAndWaitForBlob(button);
+            try {
+                const button = findDownloadButton(image.thumbnailUrl);
+                if (!button) {
+                    throw new Error('未找到对应的原生下载按钮');
+                }
 
-            // Send captured data to background for watermark removal + save
-            await new Promise<void>((resolve, reject) => {
-                chrome.runtime.sendMessage(
-                    { type: 'DOWNLOAD_IMAGE', dataUrl, filename },
-                    (res: { success: boolean; error?: string } | undefined) => {
-                        if (chrome.runtime.lastError) {
-                            reject(new Error(chrome.runtime.lastError.message));
-                            return;
-                        }
-                        if (res?.success) {
-                            resolve();
-                        } else {
-                            reject(new Error(res?.error || '下载失败'));
-                        }
-                    },
-                );
-            });
+                const dataUrl = await clickAndWaitForBlob(button);
 
-            state.result.succeeded++;
-        } catch (error) {
-            console.error(`[Gemini Batch Downloader] Failed to download image ${i + 1}:`, error);
-            state.result.failed++;
-        }
+                await new Promise<void>((resolve, reject) => {
+                    chrome.runtime.sendMessage(
+                        { type: 'DOWNLOAD_IMAGE', dataUrl, filename },
+                        (res: { success: boolean; error?: string } | undefined) => {
+                            if (chrome.runtime.lastError) {
+                                reject(new Error(chrome.runtime.lastError.message));
+                                return;
+                            }
+                            if (res?.success) {
+                                resolve();
+                            } else {
+                                reject(new Error(res?.error || '下载失败'));
+                            }
+                        },
+                    );
+                });
 
-        state.progress.completed = i + 1;
-        scheduleRender();
-    }
+                state.result.succeeded++;
+            } catch (error) {
+                console.error(`[Gemini Batch Downloader] Failed to download image ${i + 1}:`, error);
+                state.result.failed++;
+            }
+
+            state.progress.completed++;
+            scheduleRender();
+        })();
+    });
+
+    await Promise.all(tasks);
 
     setSuppressDownload(false);
     state.status = 'done';
