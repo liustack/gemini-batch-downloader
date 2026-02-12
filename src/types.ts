@@ -17,6 +17,4 @@ export interface ImageInfo {
 export type MessageType =
     | { type: 'TOGGLE_PANEL' }
     | { type: 'OPEN_PANEL' }
-    | { type: 'DOWNLOAD_IMAGES'; images: ImageInfo[]; prefix: string }
-    | { type: 'DOWNLOAD_PROGRESS'; completed: number; total: number; error?: string }
-    | { type: 'DOWNLOAD_COMPLETE'; succeeded: number; failed: number };
+    | { type: 'DOWNLOAD_IMAGE'; dataUrl: string; filename: string };

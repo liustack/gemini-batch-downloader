@@ -29,7 +29,11 @@ function computePosition(
 }
 
 async function loadImageBitmap(url: string): Promise<ImageBitmap> {
-    const response = await fetch(url);
+    // Content script 中相对路径会解析到页面域名，需用 chrome.runtime.getURL 转为扩展 URL
+    const resolvedUrl = !url.startsWith('data:')
+        ? chrome.runtime.getURL(url)
+        : url;
+    const response = await fetch(resolvedUrl);
     const blob = await response.blob();
     return createImageBitmap(blob);
 }

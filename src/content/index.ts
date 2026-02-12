@@ -6,9 +6,9 @@ import type { ImageInfo } from '../types';
 
 console.log('[Gemini Batch Downloader] Content script injected');
 
-const SIZE_SUFFIX_PATTERN = /=s\d+(?=[-?#]|$)/i;
+const SIZE_SUFFIX_PATTERN = /=s\d+[^?#]*/i;
 const GOOGLE_USER_CONTENT_PATTERN = /googleusercontent\.com/i;
-const GEMINI_PATH_PATTERN = /\/(rd-gg(?:-dl)?|gg-dl|aip-dl)\//i;
+const GEMINI_PATH_PATTERN = /\/(rd-gg(?:-dl)?|gg(?:-dl)?|aip-dl)\//i;
 const MIN_IMAGE_EDGE = 120;
 const DOWNLOAD_BUTTON_LABELS = [
     'Download full size image',
@@ -18,6 +18,77 @@ const DOWNLOAD_BUTTON_LABELS = [
 ];
 const IMAGE_CONTAINER_SELECTOR = 'button.image-button, .overlay-container';
 const PANEL_HOST_ID = 'gbd-panel-host';
+const DOWNLOAD_BUTTON_SELECTOR = 'button[data-test-id="download-generated-image-button"]';
+
+// ── Main-world interceptor injection ──────────────────────────────────
+let interceptorInjected = false;
+
+function injectInterceptor(): void {
+    if (interceptorInjected) return;
+    interceptorInjected = true;
+    const script = document.createElement('script');
+    script.src = chrome.runtime.getURL('download-interceptor.js');
+    (document.head || document.documentElement).appendChild(script);
+    script.onload = () => script.remove();
+}
+
+// Inject as early as possible so fetch is patched before any downloads
+injectInterceptor();
+
+// ── Blob capture via postMessage ──────────────────────────────────────
+type BlobResolver = (dataUrl: string) => void;
+let pendingBlobResolve: BlobResolver | null = null;
+
+window.addEventListener('message', (event) => {
+    if (event.source !== window || event.data?.type !== 'GBD_IMAGE_CAPTURED') return;
+    if (pendingBlobResolve) {
+        const resolve = pendingBlobResolve;
+        pendingBlobResolve = null;
+        resolve(event.data.dataUrl);
+    }
+});
+
+// ── Download suppression control (talks to main-world interceptor) ───
+// Uses postMessage instead of CustomEvent because event.detail
+// cannot cross the isolated world → main world boundary in Chrome.
+function setSuppressDownload(suppress: boolean): void {
+    window.postMessage({ type: 'GBD_SUPPRESS', suppress }, '*');
+}
+
+// ── Find the native "Download full size" button for a given image ────
+function findDownloadButton(thumbnailUrl: string): HTMLButtonElement | null {
+    const allImages = document.querySelectorAll('img');
+    let targetImg: HTMLImageElement | null = null;
+    for (const img of allImages) {
+        if ((img.currentSrc || img.src) === thumbnailUrl) {
+            targetImg = img;
+            break;
+        }
+    }
+    if (!targetImg) return null;
+
+    const container = targetImg.closest('.overlay-container');
+    if (!container) return null;
+
+    return container.querySelector<HTMLButtonElement>(DOWNLOAD_BUTTON_SELECTOR);
+}
+
+// ── Click native download and wait for intercepted blob ──────────────
+function clickAndWaitForBlob(button: HTMLButtonElement, timeoutMs = 30000): Promise<string> {
+    return new Promise<string>((resolve, reject) => {
+        const timer = setTimeout(() => {
+            pendingBlobResolve = null;
+            reject(new Error('等待原生下载响应超时'));
+        }, timeoutMs);
+
+        pendingBlobResolve = (dataUrl: string) => {
+            clearTimeout(timer);
+            resolve(dataUrl);
+        };
+
+        button.click();
+    });
+}
 
 type PanelStatus = 'idle' | 'loading' | 'ready' | 'error' | 'downloading' | 'done';
 
@@ -106,6 +177,11 @@ function hasNearbyDownloadButton(img: HTMLImageElement): boolean {
 
 function isLikelyGeminiImage(img: HTMLImageElement, url: string): boolean {
     if (!url || url.startsWith('data:') || url.startsWith('blob:')) {
+        return false;
+    }
+
+    // Exclude user-uploaded reference images
+    if (img.closest('user-query-file-preview, user-query-file-carousel')) {
         return false;
     }
 
@@ -663,7 +739,7 @@ function togglePanel(): void {
     openPanel();
 }
 
-function startDownload(): void {
+async function startDownload(): Promise<void> {
     if (state.status === 'downloading') {
         return;
     }
@@ -678,39 +754,58 @@ function startDownload(): void {
     state.result = { succeeded: 0, failed: 0 };
     scheduleRender();
 
-    chrome.runtime.sendMessage(
-        {
-            type: 'DOWNLOAD_IMAGES',
-            images: selectedImages,
-            prefix: state.prefix || 'gemini',
-        },
-        (
-            response:
-                | { type: string; succeeded: number; failed: number }
-                | undefined
-        ) => {
-            if (chrome.runtime.lastError) {
-                state.status = 'error';
-                state.errorMessage = chrome.runtime.lastError.message || '下载失败';
-                scheduleRender();
-                return;
+    const prefix = state.prefix || 'gemini';
+
+    // Ensure interceptor is injected and suppress native downloads
+    injectInterceptor();
+    await new Promise((r) => setTimeout(r, 100));
+    setSuppressDownload(true);
+
+    for (let i = 0; i < selectedImages.length; i++) {
+        const image = selectedImages[i];
+        const filename = `${prefix}_${i + 1}.png`;
+
+        try {
+            // Find the native "Download full size" button for this image
+            const button = findDownloadButton(image.thumbnailUrl);
+            if (!button) {
+                throw new Error('未找到对应的原生下载按钮');
             }
 
-            if (!response) {
-                state.status = 'error';
-                state.errorMessage = '下载请求失败：未收到响应';
-                scheduleRender();
-                return;
-            }
+            // Click native button and wait for intercepted blob
+            const dataUrl = await clickAndWaitForBlob(button);
 
-            state.result = {
-                succeeded: response.succeeded,
-                failed: response.failed,
-            };
-            state.status = 'done';
-            scheduleRender();
+            // Send captured data to background for watermark removal + save
+            await new Promise<void>((resolve, reject) => {
+                chrome.runtime.sendMessage(
+                    { type: 'DOWNLOAD_IMAGE', dataUrl, filename },
+                    (res: { success: boolean; error?: string } | undefined) => {
+                        if (chrome.runtime.lastError) {
+                            reject(new Error(chrome.runtime.lastError.message));
+                            return;
+                        }
+                        if (res?.success) {
+                            resolve();
+                        } else {
+                            reject(new Error(res?.error || '下载失败'));
+                        }
+                    },
+                );
+            });
+
+            state.result.succeeded++;
+        } catch (error) {
+            console.error(`[Gemini Batch Downloader] Failed to download image ${i + 1}:`, error);
+            state.result.failed++;
         }
-    );
+
+        state.progress.completed = i + 1;
+        scheduleRender();
+    }
+
+    setSuppressDownload(false);
+    state.status = 'done';
+    scheduleRender();
 }
 
 const observer = new MutationObserver(() => {
@@ -731,14 +826,6 @@ chrome.runtime.onMessage.addListener((message) => {
     if (message.type === 'OPEN_PANEL') {
         openPanel();
         return false;
-    }
-
-    if (message.type === 'DOWNLOAD_PROGRESS' && state.status === 'downloading') {
-        state.progress = {
-            completed: message.completed,
-            total: message.total,
-        };
-        scheduleRender();
     }
 
     return false;

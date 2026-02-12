@@ -1,11 +1,9 @@
-import type { ImageInfo } from '../types';
-import { removeWatermarkFromBlob } from '../core/watermarkEngine.ts';
-
 /**
- * Background Service Worker: 处理批量下载请求
- * 流程: fetch 原图 → OffscreenCanvas 去水印 → blob 下载
- * 点击扩展图标时，直接在 Gemini 页内开关面板（无 popup）。
+ * Background Service Worker: 处理面板切换、图片下载（fetch + 去水印 + 保存）
+ * Service Worker 拥有 host_permissions，可绕过 CORS 直接 fetch 图片。
  */
+
+import { removeWatermarkFromBlob } from '../core/watermarkEngine.ts';
 
 function isGeminiTab(tab: chrome.tabs.Tab): boolean {
     return typeof tab.url === 'string' && tab.url.startsWith('https://gemini.google.com/');
@@ -43,91 +41,59 @@ chrome.action.onClicked.addListener((tab) => {
     });
 });
 
+async function processAndDownload(dataUrl: string, filename: string): Promise<{ success: boolean; error?: string }> {
+    // dataUrl 由 content script 从 Gemini 原生下载流程中拦截得到
+    const response = await fetch(dataUrl);
+    let blob = await response.blob();
+    blob = await removeWatermarkFromBlob(blob);
+
+    const processedDataUrl = await new Promise<string>((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result as string);
+        reader.onerror = () => reject(reader.error);
+        reader.readAsDataURL(blob);
+    });
+
+    return new Promise((resolve) => {
+        chrome.downloads.download(
+            { url: processedDataUrl, filename, conflictAction: 'uniquify' },
+            (downloadId) => {
+                if (chrome.runtime.lastError) {
+                    resolve({ success: false, error: chrome.runtime.lastError.message });
+                    return;
+                }
+
+                const listener = (delta: chrome.downloads.DownloadDelta) => {
+                    if (delta.id !== downloadId) return;
+
+                    if (delta.state?.current === 'complete') {
+                        chrome.downloads.onChanged.removeListener(listener);
+                        resolve({ success: true });
+                    } else if (delta.state?.current === 'interrupted') {
+                        chrome.downloads.onChanged.removeListener(listener);
+                        resolve({ success: false, error: delta.error?.current });
+                    }
+                };
+                chrome.downloads.onChanged.addListener(listener);
+            },
+        );
+    });
+}
+
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
-    if (message.type === 'DOWNLOAD_IMAGES') {
-        const { images, prefix } = message as {
-            type: 'DOWNLOAD_IMAGES';
-            images: ImageInfo[];
-            prefix: string;
+    if (message.type === 'DOWNLOAD_IMAGE') {
+        const { dataUrl, filename } = message as {
+            type: 'DOWNLOAD_IMAGE';
+            dataUrl: string;
+            filename: string;
         };
-        downloadAll(images, prefix).then(sendResponse);
+
+        processAndDownload(dataUrl, filename)
+            .then(sendResponse)
+            .catch((err) => sendResponse({ success: false, error: String(err) }));
+
         return true; // 异步 sendResponse
     }
 });
-
-async function downloadAll(
-    images: ImageInfo[],
-    prefix: string,
-): Promise<{ type: string; succeeded: number; failed: number }> {
-    let succeeded = 0;
-    let failed = 0;
-    const total = images.length;
-
-    for (let i = 0; i < total; i++) {
-        const image = images[i];
-        const filename = `${prefix}_${String(i + 1).padStart(2, '0')}.png`;
-
-        try {
-            // 1. Fetch 原图
-            const response = await fetch(image.fullSizeUrl);
-            if (!response.ok) {
-                throw new Error(`Fetch failed: ${response.status}`);
-            }
-            const originalBlob = await response.blob();
-
-            // 2. 去水印（OffscreenCanvas 在 Service Worker 中可用）
-            const cleanedBlob = await removeWatermarkFromBlob(originalBlob);
-
-            // 3. 创建 blob URL 并下载
-            const blobUrl = URL.createObjectURL(cleanedBlob);
-
-            await new Promise<void>((resolve, reject) => {
-                chrome.downloads.download(
-                    { url: blobUrl, filename, conflictAction: 'uniquify' },
-                    (downloadId) => {
-                        if (chrome.runtime.lastError) {
-                            URL.revokeObjectURL(blobUrl);
-                            reject(new Error(chrome.runtime.lastError.message));
-                            return;
-                        }
-
-                        const listener = (delta: chrome.downloads.DownloadDelta) => {
-                            if (delta.id !== downloadId) return;
-
-                            if (delta.state?.current === 'complete') {
-                                chrome.downloads.onChanged.removeListener(listener);
-                                URL.revokeObjectURL(blobUrl);
-                                resolve();
-                            } else if (delta.state?.current === 'interrupted') {
-                                chrome.downloads.onChanged.removeListener(listener);
-                                URL.revokeObjectURL(blobUrl);
-                                reject(new Error(`Download interrupted: ${delta.error?.current}`));
-                            }
-                        };
-                        chrome.downloads.onChanged.addListener(listener);
-                    },
-                );
-            });
-
-            succeeded++;
-        } catch (err) {
-            console.error(`Failed to process image ${i + 1}:`, err);
-            failed++;
-        }
-
-        // 广播下载进度给页内面板
-        try {
-            chrome.runtime.sendMessage({
-                type: 'DOWNLOAD_PROGRESS',
-                completed: succeeded + failed,
-                total,
-            });
-        } catch {
-            // 页面面板可能不存在，忽略
-        }
-    }
-
-    return { type: 'DOWNLOAD_COMPLETE', succeeded, failed };
-}
 
 console.log('[Gemini Batch Downloader] Background service worker loaded');
