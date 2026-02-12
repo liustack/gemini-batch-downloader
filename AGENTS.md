@@ -1,32 +1,38 @@
 # Gemini Batch Image Downloader Project Context
 
 ## Project Overview
-这是一个 Chrome 浏览器插件，用于批量下载 Google Gemini 对话中生成的图片。
-它解决了手动一张张点击下载全尺寸图片的繁琐问题。
+This is a Chrome extension for batch-downloading full-resolution images generated in Google Gemini conversations.
+The UI is rendered as an in-page Shadow DOM panel on Gemini pages, not in a popup page.
 
 ## Tech Stack
-- **Runtime**: Chrome Extension Manifest V3
-- **Build**: Vite 6.4 + @crxjs/vite-plugin 2.3
-- **UI Framework**: In-page Shadow DOM UI + TypeScript 5.9
-- **Package Manager**: pnpm
+- Runtime: Chrome Extension Manifest V3
+- Build: Vite 6.4 + `@crxjs/vite-plugin` 2.3
+- Language: TypeScript 5.9
+- Package Manager: pnpm
 
 ## Core Features
-1. **Content Script**: 自动检测 Gemini 页面 (`gemini.google.com`) 中的生成图片 (`gg-dl` 路径)。
-2. **In-page Panel UI**: 点击扩展图标后在页面内拉起暗色面板，支持全选/反选。
-3. **Batch Download**: 通过 Background Service Worker 调用 `chrome.downloads` API 批量下载全尺寸原图 (`=s0`)。
+1. Image detection: scan and detect Gemini-generated images on `gemini.google.com`
+2. In-page panel: click extension icon to toggle panel, with select all / unselect all and filename prefix input
+3. Batch download: call `chrome.downloads.download()` from background to fetch original images
+4. Progress updates: background broadcasts progress, content script updates UI in real time
 
-## Key Implementation Details
-- **Cookie Handling**: 利用 `chrome.downloads.download()` 自动携带浏览器 Cookie 的特性，无需手动处理鉴权。
-- **Image URL**: Gemini 生成图 URL 含有 `gg-dl`，默认参数 `=s1024-rj` (压缩)，插件自动替换为 `=s0` (原始无损)。
-- **Communication**: Action Click -> Content Script (开关面板)，Content Script -> Background (触发下载)。
+## Communication
+- Action Click -> Background -> Content Script (`TOGGLE_PANEL` / `OPEN_PANEL`)
+- Content Script -> Background (`DOWNLOAD_IMAGES`)
+- Background -> Content Script (`DOWNLOAD_PROGRESS`)
+
+## Key Implementation Notes
+- Download URLs are normalized toward `=s0` to fetch full-resolution originals
+- `chrome.downloads` reuses browser cookies, avoiding custom auth handling
+- Scan logic skips the extension's own Shadow DOM to avoid self-scanning
 
 ## Development Workflow
-1. **Install**: `pnpm install`
-2. **Dev**: `pnpm dev` (HMR supported)
-3. **Build**: `pnpm build` -> output to `dist/`
-4. **Load**: Load `dist/` folder in `chrome://extensions` (Developer Mode)
+1. Install: `pnpm install`
+2. Dev: `pnpm dev`
+3. Build: `pnpm build`
+4. Load: load `dist/` in `chrome://extensions`
 
 ## Project Rules
-- 使用 `pnpm` 管理依赖。
-- 保持 Manifest V3 兼容性。
-- UI 风格需保持与 Gemini 一致的暗色主题。
+- Use `pnpm`
+- Keep Manifest V3 compatible
+- Keep the panel dark-themed and visually aligned with Gemini
